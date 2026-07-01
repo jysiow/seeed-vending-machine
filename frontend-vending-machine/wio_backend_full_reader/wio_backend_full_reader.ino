@@ -22,14 +22,14 @@
 // =====================================================
 
 // ---------------- WIFI / BACKEND ----------------
-const char* WIFI_SSID = "YOUR_WIFI_NAME";
-const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
+const char* WIFI_SSID = "SEEED-MKT";
+const char* WIFI_PASSWORD = "edgemaker2023";
 
 // For Render, example:
 // const char* BACKEND_BASE_URL = "https://your-app-name.onrender.com";
 // For local same-WiFi testing, example:
 // const char* BACKEND_BASE_URL = "http://192.168.1.23:3000";
-const char* BACKEND_BASE_URL = "https://YOUR_RENDER_URL";
+const char* BACKEND_BASE_URL = "https://opulent-goldfish-7vjxpj9wv7c6vw-3000.app.github.dev";
 
 const char* DEVICE_ID = "frontend-1";
 const char* API_KEY = "FRONTEND_1_SECRET";
