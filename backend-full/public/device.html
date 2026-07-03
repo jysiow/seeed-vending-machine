@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Backend Center - Device Setup</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div>
+      <p class="eyebrow">RFID writer - firmware - diagnostics</p>
+      <h1>Device Setup</h1>
+      <p class="subtitle">Check the XIAO ESP32C6 RFID writer over USB and flash its firmware before selling.</p>
+    </div>
+    <div class="actions">
+      <nav class="nav"><a class="nav-link" href="/index.html">Operate</a><a class="nav-link active" href="/device.html">Device Setup</a></nav>
+    </div>
+  </header>
+
+  <main class="page">
+    <section id="toolsBanner" class="banner info hidden"></section>
+
+    <section class="panel">
+      <div class="panel-header"><div><p class="section-tag">Step 1</p><h2>Connection</h2></div><div class="button-row" style="margin:0"><button class="secondary" id="refreshBtn">Refresh</button><button id="probeBtn">Test RFID module</button></div></div>
+      <div id="bigStatus" class="big-status"><span class="dot"></span><div><strong id="statusText">Checking...</strong><div class="hint" id="statusSub"></div></div></div>
+      <div class="kv">
+        <div>Port</div><div id="kvPort">-</div>
+        <div>FQBN</div><div id="kvFqbn">-</div>
+        <div>Firmware / RFID</div><div id="kvRfid">-</div>
+        <div>Last card UID</div><div id="kvUid">-</div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-header"><div><p class="section-tag">Step 2</p><h2>Flash writer firmware</h2></div></div>
+      <p class="hint">Compiles and uploads <code>test-phase/xiao-esp32c6-rfid-writer</code> to the connected XIAO with arduino-cli. Use this the first time, or if the RFID module is not answering. Takes ~20-40s.</p>
+      <div class="button-row"><button id="flashBtn">Flash writer firmware</button></div>
+      <div class="log-box hidden" id="flashLogWrap"><pre id="flashLog"></pre></div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-header"><div><p class="section-tag">Optional</p><h2>Read a card</h2></div></div>
+      <p class="hint">Place a card on the reader and read its current payload (UID + any stored balance/order).</p>
+      <div class="button-row"><button id="readBtn">Read card</button></div>
+      <div class="payload-box"><div class="payload-header"><strong>Card contents</strong></div><pre id="readOut">No card read yet.</pre></div>
+    </section>
+  </main>
+
+  <div id="toast" class="toast hidden"></div>
+  <script src="/device.js" type="module"></script>
+</body>
+</html>

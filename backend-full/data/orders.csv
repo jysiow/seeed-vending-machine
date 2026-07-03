@@ -1,2 +1,1 @@
-order_number,card_uid,user_name,q1,q2,q3,q4,status
-ORD-001,17 6C EE EA,Alice,1,0,0,0,READY
+order_number,user_name,product_id,product_name,quantity,amount_paid,status,rfid_card_uid,written_payload,created_at,written_at,verified_at,dispensed_at,frontend_id,notes

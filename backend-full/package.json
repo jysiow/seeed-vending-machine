@@ -2,12 +2,17 @@
   "name": "wio-csv-backend",
   "version": "1.0.0",
   "description": "CSV backend for Wio Terminal RFID vending machine",
-  "main": "server.js",
+  "main": "src/server.mjs",
   "scripts": {
-    "start": "node server.js",
-    "dev": "node server.js"
+    "start": "node src/server.mjs",
+    "dev": "node src/server.mjs",
+    "start:legacy": "node server.js"
   },
   "dependencies": {
-    "express": "^4.18.3"
+    "@fast-csv/format": "^5.0.7",
+    "@fast-csv/parse": "^5.0.7",
+    "cors": "^2.8.6",
+    "express": "^4.22.2",
+    "nanoid": "^5.1.16"
   }
 }

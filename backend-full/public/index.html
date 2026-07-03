@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Backend Center - Operate</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div>
+      <p class="eyebrow">RFID writer - order control - inventory sync</p>
+      <h1>Vending Machine Backend Center</h1>
+      <p class="subtitle">Sell a product or top up a card balance, write the RFID card over USB, and monitor everything from one place.</p>
+    </div>
+    <div class="actions">
+      <nav class="nav"><a class="nav-link active" href="/index.html">Operate</a><a class="nav-link" href="/device.html">Device Setup</a></nav>
+      <button class="secondary" id="refreshButton">Refresh</button>
+      <div class="pill online">CSV mode</div>
+    </div>
+  </header>
+
+  <main class="page">
+    <section id="deviceBanner" class="banner info">Checking RFID writer...</section>
+
+    <section id="metrics" class="metrics-grid"></section>
+
+    <section class="panel">
+      <div class="panel-header">
+        <div><p class="section-tag">Operate</p><h2>Sell / Write Card</h2></div>
+        <div class="mode-tabs"><button class="mode-tab active" data-mode="product">Product order</button><button class="mode-tab" data-mode="balance">Balance top-up</button></div>
+      </div>
+
+      <!-- PRODUCT MODE -->
+      <div id="productPane" class="mode-pane">
+        <div class="operate-grid">
+          <div>
+            <p class="section-tag">Step 1</p>
+            <h3 class="pane-title">Choose a product</h3>
+            <div id="productGrid" class="product-grid"></div>
+          </div>
+          <div class="operate-side">
+            <p class="section-tag">Step 2</p>
+            <h3 class="pane-title">Customer + write</h3>
+            <div id="selectedProductCard" class="selected-card empty-state">Select a product card to begin.</div>
+            <div class="form-grid">
+              <label><span>User Name</span><input id="user_name" placeholder="unique customer name" /></label>
+              <label><span>Quantity</span><input id="quantity" type="number" value="1" min="1" /></label>
+              <label><span>Amount Paid</span><input id="amount_paid" type="number" step="0.01" placeholder="e.g. 15.99" /></label>
+              <label><span>RFID Card UID (optional)</span><input id="rfid_card_uid" placeholder="filled from the card after write" /></label>
+            </div>
+            <div class="button-row">
+              <button id="createOrderWriteButton">Create order + write card (USB)</button>
+              <button class="secondary" id="createOrderQueueButton">Queue WiFi write</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- BALANCE MODE -->
+      <div id="balancePane" class="mode-pane hidden">
+        <div class="operate-grid">
+          <div class="balance-hero">
+            <p class="section-tag">Stored value</p>
+            <h3 class="pane-title">Write balance to a card</h3>
+            <p class="hint">Place the customer card on the reader. The balance is written onto the card and tracked in the backend ledger.</p>
+            <div id="balanceReadInfo" class="read-info hidden"></div>
+            <div class="quick-amounts" id="quickAmounts"></div>
+          </div>
+          <div class="operate-side">
+            <div class="form-grid">
+              <label><span>User Name</span><input id="bal_user_name" placeholder="customer name" /></label>
+              <label><span>Amount</span><input id="bal_amount" type="number" step="0.01" min="0" placeholder="e.g. 50" /></label>
+              <label><span>Mode</span><select id="bal_mode"><option value="add">Add to balance</option><option value="set">Set exact balance</option></select></label>
+              <label><span>Card UID (optional)</span><input id="bal_card_uid" placeholder="auto-detected from the card" /></label>
+            </div>
+            <div class="button-row">
+              <button id="writeBalanceButton">Write balance to card (USB)</button>
+              <button class="secondary" id="readCardButton">Read card</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="payload-box">
+        <div class="payload-header"><strong>Last write result</strong><span class="hint">Written to card blocks 4,5,6,8,9,10</span></div>
+        <pre id="payloadOutput">No card written yet.</pre>
+        <ol id="writerSteps" class="writer-steps"></ol>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-header"><div><p class="section-tag">RFID Writer</p><h2>Writer Status</h2></div><div class="hint">USB writer reports here after each write; the WiFi writer polls the API.</div></div>
+      <div id="writerStatusCards" class="writer-status-grid"></div>
+      <p id="writerMessage" class="hint"></p>
+      <div class="table-wrap"><table id="writerJobsTable"></table></div>
+    </section>
+
+    <section class="layout-two">
+      <section class="panel"><div class="panel-header"><div><p class="section-tag">Stored value</p><h2>Balance Cards</h2></div></div><div class="table-wrap"><table id="cardsTable"></table></div></section>
+      <section class="panel"><div class="panel-header"><div><p class="section-tag">Stored value</p><h2>Card Ledger</h2></div></div><div class="table-wrap"><table id="cardLedgerTable"></table></div></section>
+    </section>
+
+    <section class="panel"><div class="panel-header"><div><p class="section-tag">Catalog</p><h2>Inventory Overview</h2></div></div><div class="table-tools"><input id="inventorySearch" placeholder="Search product name" /></div><div class="table-wrap"><table id="inventoryTable"></table></div></section>
+
+    <section class="layout-two"><section class="panel"><div class="panel-header"><div><p class="section-tag">Operations</p><h2>Recent Orders</h2></div></div><div class="table-tools"><input id="orderSearch" placeholder="Search order / user / product" /></div><div class="table-wrap"><table id="ordersTable"></table></div></section><section class="panel"><div class="panel-header"><div><p class="section-tag">Customers</p><h2>Customer Summary</h2></div></div><div class="table-wrap"><table id="customersTable"></table></div></section></section>
+
+    <section class="layout-two"><section class="panel"><div class="panel-header"><div><p class="section-tag">Inventory</p><h2>Recent Inventory Log</h2></div></div><div class="table-wrap"><table id="inventoryLogTable"></table></div></section><section class="panel"><div class="panel-header"><div><p class="section-tag">Devices</p><h2>Registered Devices</h2></div></div><div class="table-wrap"><table id="devicesTable"></table></div></section></section>
+  </main>
+
+  <div id="toast" class="toast hidden"></div>
+  <script src="/app.js" type="module"></script>
+</body>
+</html>
