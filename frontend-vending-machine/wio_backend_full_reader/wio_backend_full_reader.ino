@@ -1,4 +1,4 @@
-#include <Wire.h>
+﻿#include <Wire.h>
 #include <TFT_eSPI.h>
 #include "Emakefun_RFID.h"
 #include "SCServo.h"
@@ -15,7 +15,7 @@ const char* WIFI_PASSWORD = "edgemaker2023";
 
 // Use your laptop IP on the same WiFi as the Wio Terminal.
 // Do not add a trailing slash.
-const char* BACKEND_BASE_URL = "http://192.168.7.176:3000";
+const char* BACKEND_BASE_URL = "http://192.168.7.176:3001";
 
 bool wifiReady = false;
 
@@ -28,16 +28,25 @@ const int MAX_PRODUCT_QUANTITY = 10;
 
 // ---------------- RFID ----------------
 #define RFID_ADDR 0x28
-#define ORDER_BLOCK 4
+const byte DATA_BLOCKS[] = {4, 5, 6, 8, 9, 10};
+const int DATA_BLOCK_COUNT = 6;
+const int MAX_PAYLOAD_LEN = 96;
 MFRC522 mfrc522(RFID_ADDR);
 MFRC522::MIFARE_Key rfidKey;
 bool rfidReady = false;
 
 // ---------------- SESSION ----------------
+String hardwareUid = "";
 String currentCardUID = "";
+String cardUserName = "";
 String currentOrderNumber = "";
+String collectionStatus = "";
+float cardBalance = 0.0;
 float currentBalance = 0.0;
 float remainingBalance = 0.0;
+bool cardPayloadValid = false;
+bool forceDirectCheck = false;
+int prepaidDispenseQty[PRODUCT_COUNT] = {0, 0, 0, 0};
 
 // ---------------- CARD SCAN (non-blocking) ----------------
 volatile bool cardScanInProgress = false;
@@ -853,6 +862,10 @@ String extractApiLine(const String& raw) {
   int idx = raw.indexOf("DIRECT|");
 
   if (idx < 0) {
+    idx = raw.indexOf("PREPAID_PARTIAL|");
+  }
+
+  if (idx < 0) {
     idx = raw.indexOf("PREPAID|");
   }
 
@@ -947,7 +960,7 @@ String postCardCheckBounded(unsigned long deadlineMs) {
     while (client.available()) {
       raw += (char)client.read();
 
-      if (raw.indexOf("DIRECT|") >= 0 || raw.indexOf("PREPAID|") >= 0) {
+      if (raw.indexOf("DIRECT|") >= 0 || raw.indexOf("PREPAID|") >= 0 || raw.indexOf("PREPAID_PARTIAL|") >= 0) {
         break;
       }
 
@@ -956,7 +969,7 @@ String postCardCheckBounded(unsigned long deadlineMs) {
       }
     }
 
-    if (raw.indexOf("DIRECT|") >= 0 || raw.indexOf("PREPAID|") >= 0) {
+    if (raw.indexOf("DIRECT|") >= 0 || raw.indexOf("PREPAID|") >= 0 || raw.indexOf("PREPAID_PARTIAL|") >= 0) {
       break;
     }
 
@@ -1204,66 +1217,307 @@ String getScannedUIDString() {
   return uidText;
 }
 
-String cleanOrderNumber(String input) {
-  input.trim();
-  String output = "";
-
-  for (int i = 0; i < input.length() && output.length() < 15; i++) {
-    char c = input.charAt(i);
-
-    if (
-      (c >= '0' && c <= '9') ||
-      (c >= 'A' && c <= 'Z') ||
-      (c >= 'a' && c <= 'z') ||
-      c == '_' || c == '-'
-    ) {
-      output += c;
-    }
+String jsonFieldFromCard(const String& json, const String& key) {
+  String needle = "\"" + key + "\":";
+  int p = json.indexOf(needle);
+  if (p < 0) return "";
+  p += needle.length();
+  while (p < (int)json.length() && (json[p] == ' ' || json[p] == '\t')) p++;
+  if (p >= (int)json.length()) return "";
+  if (json[p] == '"') {
+    int start = p + 1;
+    int end = json.indexOf('"', start);
+    if (end < 0) return "";
+    return json.substring(start, end);
   }
-
-  return output;
+  if (json.substring(p, p + 4) == "null") return "";
+  int end = json.indexOf(',', p);
+  if (end < 0) end = json.indexOf('}', p);
+  if (end < 0) end = json.length();
+  String val = json.substring(p, end);
+  val.trim();
+  return val;
 }
 
-bool readOrderNumberFromCard(String &orderNumber) {
-  byte buffer[18];
-  byte size = sizeof(buffer);
+String jsonFieldOrNullOut(const String& value) {
+  if (value.length() == 0) return "null";
+  return "\"" + value + "\"";
+}
 
+String buildCardPayloadV2(
+  const String& cardUid,
+  const String& userName,
+  const String& orderNumber,
+  const String& status,
+  float balance
+) {
+  char balBuf[16];
+  snprintf(balBuf, sizeof(balBuf), "%.2f", balance);
+
+  String payload = "{";
+  payload += "\"v\":2,";
+  payload += "\"uid\":" + jsonFieldOrNullOut(cardUid) + ",";
+  payload += "\"usr\":" + jsonFieldOrNullOut(userName) + ",";
+  payload += "\"ord\":" + jsonFieldOrNullOut(orderNumber) + ",";
+  payload += "\"st\":" + jsonFieldOrNullOut(status) + ",";
+  payload += "\"bal\":" + String(balBuf);
+  payload += "}";
+  return payload;
+}
+
+bool authenticateDataBlock(byte blockAddr) {
   MFRC522::StatusCode status = (MFRC522::StatusCode)mfrc522.PCD_Authenticate(
     MFRC522::PICC_CMD_MF_AUTH_KEY_A,
-    ORDER_BLOCK,
+    blockAddr,
     &rfidKey,
     &(mfrc522.uid)
   );
+  return status == MFRC522::STATUS_OK;
+}
 
-  if (status != MFRC522::STATUS_OK) {
+bool readCardPayloadFromChip(String& payloadOut) {
+  payloadOut = "";
+
+  for (int i = 0; i < DATA_BLOCK_COUNT; i++) {
+    byte buffer[18];
+    byte size = sizeof(buffer);
+    byte block = DATA_BLOCKS[i];
+
+    if (!authenticateDataBlock(block)) {
+      return false;
+    }
+
+    MFRC522::StatusCode status = (MFRC522::StatusCode)mfrc522.MIFARE_Read(block, buffer, &size);
+    if (status != MFRC522::STATUS_OK) {
+      return false;
+    }
+
+    for (int j = 0; j < 16; j++) {
+      if (buffer[j] != 0) {
+        payloadOut += (char)buffer[j];
+      }
+    }
+  }
+
+  payloadOut.trim();
+  return payloadOut.length() > 0 && payloadOut.startsWith("{");
+}
+
+bool writeCardPayloadToChip(const String& payload) {
+  if (payload.length() > MAX_PAYLOAD_LEN) {
     return false;
   }
 
-  status = (MFRC522::StatusCode)mfrc522.MIFARE_Read(ORDER_BLOCK, buffer, &size);
+  for (int i = 0; i < DATA_BLOCK_COUNT; i++) {
+    byte buffer[16];
+    memset(buffer, 0, 16);
+    int start = i * 16;
 
-  if (status != MFRC522::STATUS_OK) {
+    for (int j = 0; j < 16; j++) {
+      int idx = start + j;
+      if (idx < (int)payload.length()) {
+        buffer[j] = payload[idx];
+      }
+    }
+
+    byte block = DATA_BLOCKS[i];
+    if (!authenticateDataBlock(block)) {
+      return false;
+    }
+
+    MFRC522::StatusCode status = (MFRC522::StatusCode)mfrc522.MIFARE_Write(block, buffer, 16);
+    if (status != MFRC522::STATUS_OK) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+bool parseCardPayload(const String& payload) {
+  cardPayloadValid = false;
+  cardUserName = "";
+  currentOrderNumber = "";
+  collectionStatus = "";
+  cardBalance = 0.0;
+
+  if (!payload.startsWith("{")) {
     return false;
   }
 
-  char text[17];
+  String cardUidFromJson = jsonFieldFromCard(payload, "uid");
+  cardUserName = jsonFieldFromCard(payload, "usr");
+  currentOrderNumber = jsonFieldFromCard(payload, "ord");
+  collectionStatus = jsonFieldFromCard(payload, "st");
+  String balText = jsonFieldFromCard(payload, "bal");
 
-  for (int i = 0; i < 16; i++) {
-    text[i] = (char)buffer[i];
+  if (cardUidFromJson.length() > 0) {
+    currentCardUID = cardUidFromJson;
   }
 
-  text[16] = '\0';
-  orderNumber = cleanOrderNumber(String(text));
+  cardBalance = balText.length() > 0 ? balText.toFloat() : 0.0;
+  cardPayloadValid = (currentCardUID.length() > 0 && cardUserName.length() > 0);
 
-  Serial.print("[RFID] Order number from card: ");
-  Serial.println(orderNumber);
+  Serial.print("[RFID] Card payload uid=");
+  Serial.print(currentCardUID);
+  Serial.print(" usr=");
+  Serial.print(cardUserName);
+  Serial.print(" ord=");
+  Serial.print(currentOrderNumber.length() ? currentOrderNumber : "(null)");
+  Serial.print(" st=");
+  Serial.print(collectionStatus.length() ? collectionStatus : "(null)");
+  Serial.print(" bal=");
+  Serial.println(cardBalance);
 
-  return orderNumber.length() > 0;
+  return cardPayloadValid;
+}
+
+bool updateCardAfterRedeem(const String& newStatus) {
+  String orderForCard = currentOrderNumber;
+  String statusForCard = newStatus;
+
+  if (newStatus == "collected") {
+    orderForCard = "";
+    statusForCard = "";
+  }
+
+  String payload = buildCardPayloadV2(
+    currentCardUID,
+    cardUserName,
+    orderForCard,
+    statusForCard,
+    cardBalance
+  );
+
+  Serial.print("[RFID] Write-back payload: ");
+  Serial.println(payload);
+  return writeCardPayloadToChip(payload);
+}
+
+void dispensePrepaidQuantities(const int qty[PRODUCT_COUNT]) {
+  for (int productId = 0; productId < PRODUCT_COUNT; productId++) {
+    for (int i = 0; i < qty[productId]; i++) {
+      dispenseProduct(productId);
+      delay(500);
+    }
+  }
+}
+
+bool redeemPrepaidOrder(const int qty[PRODUCT_COUNT]) {
+  String body = "card_uid=" + urlEncode(currentCardUID);
+  body += "&user_name=" + urlEncode(cardUserName);
+  body += "&order_number=" + urlEncode(currentOrderNumber);
+  body += "&q1=" + String(qty[0]);
+  body += "&q2=" + String(qty[1]);
+  body += "&q3=" + String(qty[2]);
+  body += "&q4=" + String(qty[3]);
+
+  String response = postToBackend("/machine/redeem-order", body);
+  if (!response.startsWith("APPROVED|")) {
+    Serial.print("[HTTP] Redeem failed: ");
+    Serial.println(response);
+    return false;
+  }
+
+  int firstSep = response.indexOf('|');
+  int secondSep = response.indexOf('|', firstSep + 1);
+  if (secondSep < 0) {
+    return false;
+  }
+
+  String newStatus = response.substring(firstSep + 1, secondSep);
+  newStatus.trim();
+  newStatus.toLowerCase();
+
+  if (!updateCardAfterRedeem(newStatus)) {
+    Serial.println("[RFID] Card write-back failed after redeem");
+  }
+
+  return true;
+}
+
+void handlePrepaidDispense(String response) {
+  int firstSep = response.indexOf('|');
+  int secondSep = response.indexOf('|', firstSep + 1);
+  if (firstSep < 0 || secondSep < 0) {
+    showBackendError("Bad prepaid response");
+    delay(1200);
+    state = AUTH;
+    showWelcome();
+    return;
+  }
+
+  currentOrderNumber = response.substring(firstSep + 1, secondSep);
+  String qtyText = response.substring(secondSep + 1);
+
+  for (int i = 0; i < PRODUCT_COUNT; i++) {
+    prepaidDispenseQty[i] = 0;
+  }
+
+  if (!parseQuantities(qtyText, prepaidDispenseQty)) {
+    showBackendError("Bad quantity");
+    delay(1200);
+    state = AUTH;
+    showWelcome();
+    return;
+  }
+
+  showDispensing();
+  delay(800);
+  dispensePrepaidQuantities(prepaidDispenseQty);
+
+  if (!redeemPrepaidOrder(prepaidDispenseQty)) {
+    showBackendError("Redeem failed");
+    delay(1200);
+    state = AUTH;
+    showWelcome();
+    return;
+  }
+
+  showDone();
+  delay(1500);
+  currentOrderNumber = "";
+  collectionStatus = "";
+  forceDirectCheck = false;
+  state = AUTH;
+  showWelcome();
+}
+
+void retryDirectAfterCollected() {
+  forceDirectCheck = true;
+  currentOrderNumber = "";
+  collectionStatus = "";
+
+  cardScanInProgress = true;
+  cardScanSawUnknown = false;
+  cardScanLastResponse = "ERROR|HTTP";
+  cardScanTimedOutByWatchdog = false;
+  cardScanDeadlineMs = millis() + CARD_SCAN_TOTAL_MS;
+  cardScanLastAttemptMs = 0;
+
+  stopCardScanWatchdog();
+  startCardScanWatchdog();
+  showBackendChecking();
+}
+
+bool writeCardBalanceAfterPurchase(float newBalance) {
+  cardBalance = newBalance;
+  String payload = buildCardPayloadV2(
+    currentCardUID,
+    cardUserName,
+    currentOrderNumber,
+    collectionStatus,
+    cardBalance
+  );
+  return writeCardPayloadToChip(payload);
 }
 
 void processCardCheckResponse(String response) {
   if (response.startsWith("DIRECT|")) {
     String balanceText = response.substring(String("DIRECT|").length());
     currentBalance = balanceText.toFloat();
+    cardBalance = currentBalance;
+    forceDirectCheck = false;
 
     showAuthSuccess(currentBalance);
     delay(1200);
@@ -1279,16 +1533,24 @@ void processCardCheckResponse(String response) {
     return;
   }
 
+  if (response.startsWith("PREPAID_PARTIAL|") || response.startsWith("PREPAID|")) {
+    handlePrepaidDispense(response);
+    return;
+  }
+
   if (response.startsWith("ERROR|ALREADY_COLLECTED")) {
     showBackendError("Already collected");
+    delay(1200);
+    retryDirectAfterCollected();
+    return;
+  }
+
+  if (response.startsWith("ERROR|UNAUTHORISED") || response.startsWith("ERROR|UNKNOWN_CARD")) {
+    showAuthFail();
   } else if (response.startsWith("ERROR|ORDER_NOT_FOUND")) {
     showBackendError("Order not found");
-  } else if (response.startsWith("ERROR|UNKNOWN_CARD")) {
-    showAuthFail();
   } else if (response.startsWith("ERROR|")) {
     showBackendError("Card check failed");
-  } else if (response.startsWith("PREPAID|")) {
-    showBackendError("Prepaid flow later");
   } else if (response.startsWith("ERROR|WIFI") || response.startsWith("ERROR|HTTP")) {
     showBackendUnreachable();
   } else {
@@ -1304,6 +1566,8 @@ bool approveDirectPurchaseWithBackend() {
   showPurchaseChecking();
 
   String body = "card_uid=" + urlEncode(currentCardUID);
+  body += "&user_name=" + urlEncode(cardUserName);
+  body += "&balance=" + String(cardBalance, 2);
   body += "&q1=" + String(cartQuantities[0]);
   body += "&q2=" + String(cartQuantities[1]);
   body += "&q3=" + String(cartQuantities[2]);
@@ -1324,6 +1588,7 @@ bool approveDirectPurchaseWithBackend() {
     }
 
     remainingBalance = response.substring(firstSep + 1, secondSep).toFloat();
+    cardBalance = remainingBalance;
     String qtyText = response.substring(secondSep + 1);
 
     clearApprovedQuantities();
@@ -1336,6 +1601,10 @@ bool approveDirectPurchaseWithBackend() {
       return false;
     }
 
+    if (!writeCardBalanceAfterPurchase(remainingBalance)) {
+      Serial.println("[RFID] Failed to write balance back to card");
+    }
+
     return true;
   }
 
@@ -1343,6 +1612,8 @@ bool approveDirectPurchaseWithBackend() {
     showInsufficientBalance();
   } else if (response.startsWith("DENIED|OUT_OF_STOCK")) {
     showOutOfStock();
+  } else if (response.startsWith("DENIED|UNAUTHORISED")) {
+    showAuthFail();
   } else {
     showBackendError("Purchase denied");
   }
@@ -1355,10 +1626,17 @@ bool approveDirectPurchaseWithBackend() {
 
 // ---------------- RFID CARD SCAN ----------------
 String buildCardCheckBody() {
-  String body = "card_uid=" + urlEncode(currentCardUID);
+  String body = "hardware_uid=" + urlEncode(hardwareUid);
+  body += "&card_uid=" + urlEncode(currentCardUID);
+  body += "&user_name=" + urlEncode(cardUserName);
+  body += "&balance=" + String(cardBalance, 2);
 
-  if (currentOrderNumber.length() > 0) {
+  if (!forceDirectCheck && currentOrderNumber.length() > 0) {
     body += "&order_number=" + urlEncode(currentOrderNumber);
+  }
+
+  if (!forceDirectCheck && collectionStatus.length() > 0) {
+    body += "&collection_status=" + urlEncode(collectionStatus);
   }
 
   return body;
@@ -1373,7 +1651,7 @@ void finishCardScanTimeout() {
   cardScanTimedOutByWatchdog = false;
 
   if (cardScanSawUnknown && !isBackendUnreachable(cardScanLastResponse)) {
-    Serial.println("[RFID] Card not in CSV after 10 seconds");
+    Serial.println("[RFID] Unauthorised card after scan");
     showAuthFail();
     delay(1200);
   } else {
@@ -1423,13 +1701,26 @@ void pollCardScanBackend() {
 
   if (
     cardScanLastResponse.startsWith("DIRECT|") ||
-    cardScanLastResponse.startsWith("PREPAID|")
+    cardScanLastResponse.startsWith("PREPAID|") ||
+    cardScanLastResponse.startsWith("PREPAID_PARTIAL|")
   ) {
     stopCardScanWatchdog();
     cardScanInProgress = false;
     stopRFID();
     delay(300);
     processCardCheckResponse(cardScanLastResponse);
+    return;
+  }
+
+  if (cardScanLastResponse.startsWith("ERROR|UNAUTHORISED")) {
+    stopCardScanWatchdog();
+    cardScanInProgress = false;
+    stopRFID();
+    delay(300);
+    showAuthFail();
+    delay(1200);
+    recoverAfterFailedCardScan();
+    showWelcome();
     return;
   }
 
@@ -1478,9 +1769,19 @@ void scanRFIDCard() {
     return;
   }
 
-  currentCardUID = getScannedUIDString();
+  hardwareUid = getScannedUIDString();
   printScannedUID();
-  currentOrderNumber = "";
+
+  String payload = "";
+  if (!readCardPayloadFromChip(payload) || !parseCardPayload(payload)) {
+    Serial.println("[RFID] Invalid or missing card JSON");
+    showAuthFail();
+    delay(1200);
+    stopRFID();
+    return;
+  }
+
+  forceDirectCheck = false;
 
   cardScanInProgress = true;
   cardScanSawUnknown = false;
