@@ -1,1 +1,11 @@
 time,card_uid,user_name,type,amount,balance_after,actor,notes
+2026-07-05T09:48:31.058Z,,matt,TOPUP,50,50,operator,queued for Wio writer
+2026-07-05T09:53:02.516Z,21 0E 4A A0,matt,PURCHASE,47.97,2.030000000000001,frontend-1,P001x3
+2026-07-05T10:16:46.212Z,,matthew,TOPUP,50,50,operator,queued for Wio writer
+2026-07-05T10:17:00.236Z,,matthew,TOPUP,50,100,operator,queued for Wio writer
+2026-07-05T10:17:36.173Z,21 0E 4A A0,matthew,PURCHASE,88.35000000000001,11.649999999999991,frontend-1,P001x2 P002x3 P003x6
+2026-07-05T15:56:16.041Z,,matthew3,TOPUP,50,50,operator,queued for Wio writer
+2026-07-05T15:58:22.858Z,,matthew3,TOPUP,50,100,operator,queued for Wio writer
+2026-07-05T15:59:58.718Z,,matthew3,TOPUP,33,133,operator,queued for Wio writer
+2026-07-05T16:02:15.452Z,,matthew3,TOPUP,22,155,operator,queued for Wio writer
+2026-07-06T03:36:41.817Z,,fansng,TOPUP,2000,2000,operator,queued for Wio writer

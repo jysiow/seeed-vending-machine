@@ -19,7 +19,7 @@ export const inventoryHeaders = ['product_id', 'name', 'servo_id', 'stock', 'pri
 export const cardHeaders = ['card_uid', 'user_name', 'mode', 'balance'];
 
 // Add-on schemas for fields that do not fit the remote shape.
-export const productMetaHeaders = ['product_id', 'slot_id', 'low_stock_threshold', 'active', 'tag', 'description', 'feature_1', 'feature_2', 'feature_3', 'image_path', 'product_url'];
+export const productMetaHeaders = ['product_id', 'slot_id', 'low_stock_threshold', 'max_capacity', 'active', 'tag', 'description', 'feature_1', 'feature_2', 'feature_3', 'image_path', 'product_url'];
 export const cardMetaHeaders = ['card_uid', 'status', 'created_at', 'updated_at', 'last_payload', 'notes'];
 
 export const DEFAULT_CARD_MODE = 'DIRECT';
@@ -38,6 +38,7 @@ export async function readProducts() {
       inventory: row.stock,
       slot_id: m.slot_id || '',
       low_stock_threshold: m.low_stock_threshold || '0',
+      max_capacity: m.max_capacity || '10',
       active: m.active || 'true',
       tag: m.tag || '',
       description: m.description || '',
@@ -62,6 +63,7 @@ export async function writeProducts(products) {
     product_id: p.product_id,
     slot_id: p.slot_id,
     low_stock_threshold: p.low_stock_threshold,
+    max_capacity: p.max_capacity,
     active: p.active,
     tag: p.tag,
     description: p.description,
