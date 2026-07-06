@@ -6,7 +6,8 @@
   "scripts": {
     "start": "node src/server.mjs",
     "dev": "node src/server.mjs",
-    "start:legacy": "node server.js"
+    "start:legacy": "node server.js",
+    "start:vending": "node server-vending.js"
   },
   "dependencies": {
     "@fast-csv/format": "^5.0.7",

@@ -1,24 +1,13 @@
 /*
-  Wio Terminal RFID Writer for Backend Center
+  Wio Terminal RFID Writer — card payload v2
 
-  Hardware:
-  - Wio Terminal
-  - Emakefun MFRC522 I2C RFID module, default I2C address 0x28
-  - Connect RFID: 5V, GND, SDA, SCL to the Wio Terminal I2C/Grove I2C pins
+  Writes JSON to MIFARE blocks 4,5,6,8,9,10:
+  {"v":2,"uid":"..","usr":"..","ord":null,"st":null,"bal":0}
 
-  Behavior:
-  1. Power up
-  2. Check RFID module and card presence
-  3. Check backend-center connection
-  4. Poll backend-center for pending RFID write jobs
-  5. When card is present, write user_name/order_number payload to card
-  6. Report result to backend-center
-
-  Libraries required:
-  - Seeed Wio Terminal board support
-  - Seeed_Arduino_rpcWiFi / rpcWiFi
-  - Seeed LCD library / TFT_eSPI included by Wio Terminal board package
-  - Emakefun_RFID.cpp / Emakefun_RFID.h copied in this sketch folder
+  Job types from backend:
+  - full_write
+  - mark_collected (read-modify-write, set st=collected)
+  - mark_partial   (read-modify-write, set st=partial)
 */
 
 #include <Arduino.h>
@@ -28,27 +17,23 @@
 #include <HTTPClient.h>
 #include "Emakefun_RFID.h"
 
-// ---------------- User config ----------------
-const char* WIFI_SSID = "YOUR_WIFI_SSID";
-const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
-const char* API_BASE = "http://YOUR_PC_IP:3000";  // example: http://192.168.1.20:3000
+const char* WIFI_SSID = "SEEED-MKT";
+const char* WIFI_PASSWORD = "edgemaker2023";
+const char* API_BASE = "http://192.168.7.176:3001";
 const char* DEVICE_ID = "wio-rfid-writer";
 const char* API_KEY = "WIO_WRITER_SECRET";
 
-// ---------------- RFID ----------------
 #define RFID_ADDR 0x28
 MFRC522 mfrc522(RFID_ADDR);
 MFRC522::MIFARE_Key key;
 
-// Data blocks for MIFARE Classic 1K. Do not write sector trailer blocks 7 or 11.
 const byte DATA_BLOCKS[] = {4, 5, 6, 8, 9, 10};
 const int DATA_BLOCK_COUNT = sizeof(DATA_BLOCKS) / sizeof(DATA_BLOCKS[0]);
 const int MAX_PAYLOAD_LEN = DATA_BLOCK_COUNT * 16;
 
-// ---------------- UI ----------------
 TFT_eSPI tft;
 String currentJobId = "";
-String currentOrderNumber = "";
+String currentJobType = "";
 String currentPayload = "";
 String lastCardUid = "";
 bool rfidReady = false;
@@ -62,18 +47,44 @@ String jsonValue(const String& json, const String& key) {
   int p = json.indexOf(needle);
   if (p < 0) return "";
   p += needle.length();
-  while (p < json.length() && (json[p] == ' ' || json[p] == '\t')) p++;
-  if (p >= json.length()) return "";
+  while (p < (int)json.length() && (json[p] == ' ' || json[p] == '\t')) p++;
+  if (p >= (int)json.length()) return "";
   if (json[p] == '"') {
     int start = p + 1;
     int end = json.indexOf('"', start);
     if (end < 0) return "";
     return json.substring(start, end);
   }
+  if (json.substring(p, p + 4) == "null") return "";
   int end = json.indexOf(',', p);
   if (end < 0) end = json.indexOf('}', p);
   if (end < 0) end = json.length();
-  return json.substring(p, end);
+  String val = json.substring(p, end);
+  val.trim();
+  return val;
+}
+
+String jsonFieldOrNull(const String& value) {
+  if (value.length() == 0) return "null";
+  return "\"" + value + "\"";
+}
+
+String buildPayloadV2(
+  const String& cardUid,
+  const String& userName,
+  const String& orderNumber,
+  const String& collectionStatus,
+  const String& balance
+) {
+  String payload = "{";
+  payload += "\"v\":2,";
+  payload += "\"uid\":" + jsonFieldOrNull(cardUid) + ",";
+  payload += "\"usr\":" + jsonFieldOrNull(userName) + ",";
+  payload += "\"ord\":" + jsonFieldOrNull(orderNumber) + ",";
+  payload += "\"st\":" + jsonFieldOrNull(collectionStatus) + ",";
+  payload += "\"bal\":" + (balance.length() ? balance : "0");
+  payload += "}";
+  return payload;
 }
 
 void drawDashboard(const String& message) {
@@ -81,7 +92,6 @@ void drawDashboard(const String& message) {
   tft.setTextSize(2);
   tft.setTextColor(TFT_GREEN, TFT_BLACK);
   tft.drawString("RFID WRITER", 10, 8);
-
   tft.setTextSize(1);
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
   tft.drawString(String("WiFi: ") + (WiFi.status() == WL_CONNECTED ? "OK" : "NO"), 10, 42);
@@ -90,8 +100,6 @@ void drawDashboard(const String& message) {
   tft.drawString(String("Card: ") + (cardPresent ? "PRESENT" : "WAITING"), 10, 102);
   tft.drawString(String("UID: ") + (lastCardUid.length() ? lastCardUid : "-"), 10, 122);
   tft.drawString(String("Job: ") + (currentJobId.length() ? currentJobId : "-"), 10, 142);
-  tft.drawString(String("Order: ") + (currentOrderNumber.length() ? currentOrderNumber : "-"), 10, 162);
-
   tft.setTextColor(TFT_YELLOW, TFT_BLACK);
   tft.drawString(message.substring(0, 38), 10, 200);
 }
@@ -146,8 +154,23 @@ String readUidString() {
 }
 
 bool authenticateBlock(byte blockAddr) {
-  byte status = mfrc522.PCD_Authenticate(MFRC522::PICC_CMD_MF_AUTH_KEY_A, blockAddr, &key, &(mfrc522.uid));
-  return status == MFRC522::STATUS_OK;
+  return mfrc522.PCD_Authenticate(MFRC522::PICC_CMD_MF_AUTH_KEY_A, blockAddr, &key, &(mfrc522.uid)) == MFRC522::STATUS_OK;
+}
+
+bool readPayloadFromCard(String& out) {
+  out = "";
+  for (int i = 0; i < DATA_BLOCK_COUNT; i++) {
+    byte buffer[18];
+    byte size = sizeof(buffer);
+    byte block = DATA_BLOCKS[i];
+    if (!authenticateBlock(block)) return false;
+    if (mfrc522.MIFARE_Read(block, buffer, &size) != MFRC522::STATUS_OK) return false;
+    for (int j = 0; j < 16; j++) {
+      if (buffer[j] != 0) out += (char)buffer[j];
+    }
+  }
+  out.trim();
+  return out.length() > 0 && out.startsWith("{");
 }
 
 bool writePayloadToCard(const String& payload) {
@@ -158,12 +181,11 @@ bool writePayloadToCard(const String& payload) {
     int start = i * 16;
     for (int j = 0; j < 16; j++) {
       int idx = start + j;
-      if (idx < payload.length()) buffer[j] = payload[idx];
+      if (idx < (int)payload.length()) buffer[j] = payload[idx];
     }
     byte block = DATA_BLOCKS[i];
     if (!authenticateBlock(block)) return false;
-    byte status = mfrc522.MIFARE_Write(block, buffer, 16);
-    if (status != MFRC522::STATUS_OK) return false;
+    if (mfrc522.MIFARE_Write(block, buffer, 16) != MFRC522::STATUS_OK) return false;
   }
   return true;
 }
@@ -178,26 +200,58 @@ void reportJobResult(bool success, const String& message) {
   httpRequest("POST", "/api/rfid-writer/job-result", body);
 }
 
+void clearCurrentJob() {
+  currentJobId = "";
+  currentJobType = "";
+  currentPayload = "";
+}
+
 void pollJob() {
   if (currentJobId.length() > 0) return;
   String res = httpRequest("GET", "/api/rfid-writer/next-job");
   if (res.length() == 0) return;
-  String hasJob = jsonValue(res, "has_job");
-  if (hasJob != "true") return;
+  if (jsonValue(res, "has_job") != "true") return;
+
   currentJobId = jsonValue(res, "job_id");
+  currentJobType = jsonValue(res, "job_type");
+  String cardUid = jsonValue(res, "card_uid");
   String userName = jsonValue(res, "user_name");
-  currentOrderNumber = jsonValue(res, "order_number");
+  String orderNumber = jsonValue(res, "order_number");
+  String collectionStatus = jsonValue(res, "collection_status");
+  String balance = jsonValue(res, "balance");
 
-  // The server stores JSON in CSV, so the HTTP response contains escaped quotes.
-  // To keep the Arduino-side parser simple and reliable, compose the exact
-  // RFID card JSON locally from the plain user_name and order_number fields.
-  currentPayload = "{\"user_name\":\"" + userName + "\",\"order_number\":\"" + currentOrderNumber + "\",\"v\":1}";
-
-  if (currentJobId.length() == 0 || userName.length() == 0 || currentOrderNumber.length() == 0) {
-    currentJobId = "";
-    currentOrderNumber = "";
+  if (currentJobType == "full_write") {
+    currentPayload = buildPayloadV2(cardUid, userName, orderNumber, collectionStatus, balance);
+  } else {
     currentPayload = "";
   }
+
+  if (currentJobId.length() == 0) {
+    clearCurrentJob();
+  }
+}
+
+bool executeJobOnCard() {
+  if (currentJobType == "full_write") {
+    return writePayloadToCard(currentPayload);
+  }
+
+  String existing = "";
+  if (!readPayloadFromCard(existing)) return false;
+
+  String cardUid = jsonValue(existing, "uid");
+  String userName = jsonValue(existing, "usr");
+  String orderNumber = jsonValue(existing, "ord");
+  String balance = jsonValue(existing, "bal");
+  if (balance.length() == 0) balance = "0";
+
+  String newStatus = "";
+  if (currentJobType == "mark_collected") newStatus = "collected";
+  else if (currentJobType == "mark_partial") newStatus = "partial";
+  else return false;
+
+  String payload = buildPayloadV2(cardUid, userName, orderNumber, newStatus, balance);
+  return writePayloadToCard(payload);
 }
 
 void setup() {
@@ -205,21 +259,17 @@ void setup() {
   tft.begin();
   tft.setRotation(3);
   drawDashboard("Booting...");
-
   Wire.begin();
   mfrc522.PCD_Init();
   for (byte i = 0; i < 6; i++) key.keyByte[i] = 0xFF;
   rfidReady = true;
-
   connectWifi();
   sendStatus("Wio RFID writer booted");
   drawDashboard("Ready. Waiting for job/card.");
 }
 
 void loop() {
-  if (WiFi.status() != WL_CONNECTED) {
-    connectWifi();
-  }
+  if (WiFi.status() != WL_CONNECTED) connectWifi();
 
   if (millis() - lastPollMs > 2000) {
     lastPollMs = millis();
@@ -232,23 +282,19 @@ void loop() {
     lastCardUid = readUidString();
     drawDashboard("Card detected.");
 
-    if (currentJobId.length() > 0 && currentPayload.length() > 0) {
+    if (currentJobId.length() > 0) {
       drawDashboard("Writing card...");
-      bool ok = writePayloadToCard(currentPayload);
+      bool ok = executeJobOnCard();
       if (ok) {
         reportJobResult(true, "RFID card written successfully");
         drawDashboard("Write OK. Remove card.");
-        currentJobId = "";
-        currentOrderNumber = "";
-        currentPayload = "";
       } else {
-        reportJobResult(false, "RFID write failed. Check card type/auth/key.");
+        reportJobResult(false, "RFID write failed");
         drawDashboard("Write failed.");
-        currentJobId = "";
-        currentOrderNumber = "";
-        currentPayload = "";
       }
+      clearCurrentJob();
     }
+
     mfrc522.PICC_HaltA();
     mfrc522.PCD_StopCrypto1();
     delay(1200);
@@ -257,7 +303,7 @@ void loop() {
   if (millis() - lastStatusMs > 3000) {
     lastStatusMs = millis();
     sendStatus(currentJobId.length() ? "Waiting for card to write job" : "Idle. Waiting for server job");
-    drawDashboard(currentJobId.length() ? "Place card to write." : "Ready. Create order on server.");
+    drawDashboard(currentJobId.length() ? "Place card to write." : "Ready. Create job on server.");
   }
   delay(100);
 }
