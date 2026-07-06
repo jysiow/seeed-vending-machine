@@ -4,6 +4,7 @@ import path from 'path';
 import { nanoid } from 'nanoid';
 import { readCsv, writeCsv, appendCsv, nowIso } from './csvStore.mjs';
 import * as device from './deviceTools.mjs';
+import * as wio from './wioTools.mjs';
 import { readProducts, writeProducts, readCards, writeCards } from './dataMap.mjs';
 
 const app = express();
@@ -21,6 +22,7 @@ const deviceStatusHeaders = ['device_id','device_type','server_connected','rfid_
 const cardLedgerHeaders = ['time','card_uid','user_name','type','amount','balance_after','actor','notes'];
 
 const validOrderStartStates = new Set(['RFID_WRITTEN']);
+const WIO_TARGET_KEYS = ['frontend', 'writer'];
 
 function toNumber(value, fallback = 0) {
   const n = Number(value);
@@ -70,16 +72,16 @@ function friendlyCardError(result) {
   return 'Card write failed. Use a MIFARE Classic 1K card, re-seat it, and retry.';
 }
 
-// Reserve stock and create an order row. Throws Error with .code for HTTP status.
+// Create a "direct" order row. Throws Error with .code for HTTP status.
+// Official model: stock is NOT reserved here. It is deducted at dispense time
+// (verify-card), so a card is only ever fulfilled if the column still has stock
+// when the customer collects - and the machine stops if a refill is needed.
 async function createOrderRecord({ user_name, product_id, quantity, amount_paid, rfid_card_uid, status, notes }) {
   const qty = toNumber(quantity, 1);
   const rawProducts = await readProducts();
   const product = rawProducts.find(p => p.product_id === product_id);
   if (!product || String(product.active) !== 'true') { const e = new Error('product unavailable'); e.code = 404; throw e; }
   if (toNumber(product.inventory) < qty) { const e = new Error('not enough inventory'); e.code = 409; throw e; }
-
-  product.inventory = String(toNumber(product.inventory) - qty);
-  await writeProducts(rawProducts);
 
   const order_number = makeOrderNumber();
   const written_payload = makeWriterPayload(user_name, order_number);
@@ -92,8 +94,6 @@ async function createOrderRecord({ user_name, product_id, quantity, amount_paid,
   };
   orders.push(newOrder);
   await writeCsv('orders.csv', orders, orderHeaders);
-
-  await appendCsv('inventory_log.csv', { time: nowIso(), action: 'RESERVE_FOR_ORDER', product_id: product.product_id, product_name: product.product_name, quantity_delta: -qty, inventory_after: product.inventory, actor: 'backend-center', notes: order_number }, inventoryLogHeaders);
 
   const customers = await readCsv('customers.csv');
   let customer = customers.find(c => c.user_name === user_name);
@@ -109,14 +109,43 @@ async function createOrderRecord({ user_name, product_id, quantity, amount_paid,
 
 async function getProducts() {
   const products = await readProducts();
-  return products.map(p => ({
-    ...p,
-    price: toNumber(p.price),
-    inventory: toNumber(p.inventory),
-    low_stock_threshold: toNumber(p.low_stock_threshold),
-    active: String(p.active) === 'true',
-    is_low_stock: toNumber(p.inventory) <= toNumber(p.low_stock_threshold)
-  }));
+  return products.map(p => {
+    const inventory = toNumber(p.inventory);
+    const threshold = toNumber(p.low_stock_threshold);
+    const maxCapacity = toNumber(p.max_capacity, 10) || 10;
+    return {
+      ...p,
+      price: toNumber(p.price),
+      inventory,
+      low_stock_threshold: threshold,
+      max_capacity: maxCapacity,
+      active: String(p.active) === 'true',
+      is_low_stock: inventory <= threshold,
+      needs_refill: inventory <= threshold,
+      is_full: inventory >= maxCapacity,
+      available: inventory > 0
+    };
+  });
+}
+
+// Fixed 4-length arrays indexed by servo id 1..4, for the on-screen selecting UI.
+function servoIndexedArrays(products) {
+  const name = ['', '', '', ''];
+  const price = [0, 0, 0, 0];
+  const stock = [0, 0, 0, 0];
+  const needs = [0, 0, 0, 0];
+  const active = [0, 0, 0, 0];
+  for (const p of products) {
+    const s = toNumber(p.servo_id);
+    if (s >= 1 && s <= 4) {
+      name[s - 1] = p.product_name || '';
+      price[s - 1] = toNumber(p.price);
+      stock[s - 1] = toNumber(p.inventory);
+      needs[s - 1] = (toNumber(p.inventory) <= toNumber(p.low_stock_threshold)) ? 1 : 0;
+      active[s - 1] = (String(p.active) === 'true') ? 1 : 0;
+    }
+  }
+  return { servo: [1, 2, 3, 4], name: name.join('|'), price, stock, needs_refill: needs, active };
 }
 
 function makeOrderNumber() {
@@ -126,7 +155,95 @@ function makeOrderNumber() {
 }
 
 function makeWriterPayload(userName, orderNumber) {
-  return JSON.stringify({ user_name: userName, order_number: orderNumber, v: 1 });
+  return JSON.stringify({ type: 'direct', user_name: userName, order_number: orderNumber, v: 1 });
+}
+
+function makeBalancePayload(userName) {
+  return JSON.stringify({ type: 'selecting', user_name: userName, v: 1 });
+}
+
+// Resolve an order's line items. Multi-product direct orders (product_id MULTI)
+// and selecting checkouts (SELECT) store a JSON array in written_payload; a
+// plain single-product order is just its own product_id + quantity.
+function orderItems(order) {
+  if (order.product_id === 'MULTI' || order.product_id === 'SELECT') {
+    try { return JSON.parse(order.written_payload || '[]'); } catch { return []; }
+  }
+  if (order.product_id) return [{ product_id: order.product_id, qty: toNumber(order.quantity, 1) }];
+  return [];
+}
+
+// Give stock (and, for selecting, balance) back when a dispense is reported
+// failed or an in-flight order is cancelled. The stock was removed at the
+// authorize step (verify-card / selecting checkout).
+async function rollbackOrder(order, actor) {
+  const rawProducts = await readProducts();
+  const items = orderItems(order);
+  for (const item of items) {
+    const product = rawProducts.find(p => p.product_id === item.product_id);
+    if (!product) continue;
+    product.inventory = String(toNumber(product.inventory) + toNumber(item.qty));
+    await appendCsv('inventory_log.csv', { time: nowIso(), action: 'DISPENSE_ROLLBACK', product_id: product.product_id, product_name: product.product_name, quantity_delta: toNumber(item.qty), inventory_after: product.inventory, actor, notes: order.order_number }, inventoryLogHeaders);
+  }
+  await writeProducts(rawProducts);
+
+  if (order.product_id === 'SELECT' && toNumber(order.amount_paid) > 0) {
+    const cards = await readCards();
+    const card = cards.find(c => c.user_name === order.user_name);
+    if (card) {
+      const refunded = toNumber(card.balance) + toNumber(order.amount_paid);
+      card.balance = String(refunded);
+      card.updated_at = nowIso();
+      await writeCards(cards);
+      await appendCsv('card_ledger.csv', { time: nowIso(), card_uid: card.card_uid || order.rfid_card_uid || '', user_name: order.user_name, type: 'REFUND', amount: String(toNumber(order.amount_paid)), balance_after: String(refunded), actor, notes: order.order_number }, cardLedgerHeaders);
+    }
+  }
+}
+
+// Create a multi-product "direct" order: the operator pre-selects several
+// products + quantities on one card. Items live in written_payload as JSON;
+// stock is deducted at dispense time (verify-card), like single-product orders.
+async function createDirectMultiOrder({ user_name, items, amount_paid, rfid_card_uid }) {
+  const rawProducts = await readProducts();
+  const clean = [];
+  const names = [];
+  let total = 0, units = 0;
+  for (const it of (items || [])) {
+    const qty = Math.max(0, Math.round(toNumber(it.quantity ?? it.qty, 0)));
+    if (qty <= 0) continue;
+    const product = rawProducts.find(p => p.product_id === it.product_id);
+    if (!product || String(product.active) !== 'true') { const e = new Error(`product ${it.product_id} unavailable`); e.code = 404; throw e; }
+    if (toNumber(product.inventory) < qty) { const e = new Error(`not enough inventory for ${product.product_name}`); e.code = 409; throw e; }
+    clean.push({ product_id: product.product_id, qty });
+    names.push(`${product.product_name} x${qty}`);
+    total += toNumber(product.price) * qty;
+    units += qty;
+  }
+  if (clean.length === 0) { const e = new Error('select at least one product'); e.code = 400; throw e; }
+
+  const order_number = makeOrderNumber();
+  const written_payload = makeWriterPayload(user_name, order_number); // card JSON for the writer
+  const amount = (amount_paid !== '' && amount_paid != null) ? amount_paid : Math.round(total * 100) / 100;
+  const orders = await readCsv('orders.csv');
+  const newOrder = {
+    order_number, user_name, product_id: 'MULTI', product_name: `Direct: ${names.join(', ')}`,
+    quantity: String(units), amount_paid: String(amount), status: 'RFID_WRITTEN',
+    rfid_card_uid: rfid_card_uid || '', written_payload: JSON.stringify(clean), created_at: nowIso(),
+    written_at: '', verified_at: '', dispensed_at: '', frontend_id: '', notes: 'Direct multi-order'
+  };
+  orders.push(newOrder);
+  await writeCsv('orders.csv', orders, orderHeaders);
+
+  const customers = await readCsv('customers.csv');
+  let customer = customers.find(c => c.user_name === user_name);
+  if (!customer) { customer = { user_name, total_paid: '0', total_orders: '0', last_order_number: '', created_at: nowIso(), updated_at: nowIso() }; customers.push(customer); }
+  customer.total_paid = String(toNumber(customer.total_paid) + toNumber(amount));
+  customer.total_orders = String(toNumber(customer.total_orders) + 1);
+  customer.last_order_number = order_number;
+  customer.updated_at = nowIso();
+  await writeCsv('customers.csv', customers, customerHeaders);
+
+  return { order: newOrder, written_payload, total };
 }
 
 function summarizeMetrics(products, customers, orders, writerJobs, cards = []) {
@@ -137,7 +254,10 @@ function summarizeMetrics(products, customers, orders, writerJobs, cards = []) {
     pending_count: orders.filter(o => ['PENDING_WRITE','RFID_WRITTEN','VERIFIED'].includes(o.status)).length,
     completed_count: orders.filter(o => o.status === 'DISPENSED').length,
     low_stock_count: products.filter(p => p.is_low_stock).length,
+    refill_count: products.filter(p => p.needs_refill).length,
+    full_count: products.filter(p => p.is_full).length,
     inventory_units_total: products.reduce((sum, p) => sum + p.inventory, 0),
+    capacity_total: products.reduce((sum, p) => sum + (p.max_capacity || 0), 0),
     total_revenue: orders.reduce((sum, o) => sum + toNumber(o.amount_paid), 0),
     writer_pending_count: writerJobs.filter(j => ['PENDING','CLAIMED'].includes(j.status)).length,
     writer_written_count: writerJobs.filter(j => j.status === 'WRITTEN').length,
@@ -198,20 +318,59 @@ app.post('/api/products/:productId/refill', async (req, res, next) => {
     const rawProducts = await readProducts();
     const product = rawProducts.find(p => p.product_id === req.params.productId);
     if (!product) return res.status(404).json({ ok: false, error: 'product not found' });
-    product.inventory = String(toNumber(product.inventory) + qty);
+    const maxCapacity = toNumber(product.max_capacity, 10) || 10;
+    const current = toNumber(product.inventory);
+    if (current + qty > maxCapacity) {
+      return res.status(409).json({ ok: false, error: 'over_capacity', message: `Column ${product.slot_id || product.servo_id} holds at most ${maxCapacity}. It has ${current}; you can add ${Math.max(0, maxCapacity - current)} more.` });
+    }
+    product.inventory = String(current + qty);
     await writeProducts(rawProducts);
     await appendCsv('inventory_log.csv', { time: nowIso(), action: 'REFILL', product_id: product.product_id, product_name: product.product_name, quantity_delta: qty, inventory_after: product.inventory, actor: 'dashboard', notes: req.body.notes || '' }, inventoryLogHeaders);
-    res.json({ ok: true, product });
+    const [fresh] = (await getProducts()).filter(p => p.product_id === product.product_id);
+    res.json({ ok: true, product: fresh || product });
+  } catch (err) { next(err); }
+});
+
+// Initialize / set the exact number of products currently loaded in each column.
+// Backs the operator "Initialize + Refill" page. Body: { items:[{product_id,count}] }.
+app.post('/api/inventory/initialize', async (req, res, next) => {
+  try {
+    const items = Array.isArray(req.body.items) ? req.body.items : [];
+    if (items.length === 0) return res.status(400).json({ ok: false, error: 'items array is required' });
+    const rawProducts = await readProducts();
+    const applied = [];
+    for (const item of items) {
+      const product = rawProducts.find(p => p.product_id === item.product_id);
+      if (!product) continue;
+      const maxCapacity = toNumber(product.max_capacity, 10) || 10;
+      let count = Math.round(toNumber(item.count, 0));
+      if (count < 0) count = 0;
+      if (count > maxCapacity) count = maxCapacity;
+      const before = toNumber(product.inventory);
+      product.inventory = String(count);
+      applied.push({ product_id: product.product_id, from: before, to: count });
+      await appendCsv('inventory_log.csv', { time: nowIso(), action: 'INIT', product_id: product.product_id, product_name: product.product_name, quantity_delta: count - before, inventory_after: String(count), actor: 'operator', notes: 'initialize page' }, inventoryLogHeaders);
+    }
+    await writeProducts(rawProducts);
+    res.json({ ok: true, applied, products: await getProducts() });
   } catch (err) { next(err); }
 });
 
 app.post('/api/orders/create-and-prepare-card', async (req, res, next) => {
   try {
-    const { user_name, product_id, quantity = 1, amount_paid = '', rfid_card_uid = '' } = req.body;
-    if (!user_name || !product_id) return res.status(400).json({ ok: false, error: 'user_name and product_id are required' });
-    if (toNumber(quantity, 1) <= 0) return res.status(400).json({ ok: false, error: 'quantity must be greater than 0' });
+    const { user_name, product_id, quantity = 1, amount_paid = '', rfid_card_uid = '', items } = req.body;
+    if (!user_name) return res.status(400).json({ ok: false, error: 'user_name is required' });
 
-    const { order, written_payload } = await createOrderRecord({ user_name, product_id, quantity, amount_paid, rfid_card_uid, status: 'RFID_WRITTEN', notes: 'Waiting for Wio RFID writer' });
+    // items[] => multi-product direct order on one card; else single product.
+    let result;
+    if (Array.isArray(items) && items.some(it => toNumber(it.quantity ?? it.qty, 0) > 0)) {
+      result = await createDirectMultiOrder({ user_name, items, amount_paid, rfid_card_uid });
+    } else {
+      if (!product_id) return res.status(400).json({ ok: false, error: 'product_id or items[] is required' });
+      if (toNumber(quantity, 1) <= 0) return res.status(400).json({ ok: false, error: 'quantity must be greater than 0' });
+      result = await createOrderRecord({ user_name, product_id, quantity, amount_paid, rfid_card_uid, status: 'RFID_WRITTEN', notes: 'Waiting for Wio RFID writer' });
+    }
+    const { order, written_payload } = result;
 
     const writerJobs = await readCsv('writer_jobs.csv');
     const writerJob = { job_id: `WJ-${nanoid(8).toUpperCase()}`, order_number: order.order_number, user_name, rfid_payload: written_payload, rfid_card_uid, status: 'PENDING', created_at: nowIso(), claimed_at: '', written_at: '', device_id: '', message: 'Waiting for card on Wio Terminal', job_type: 'ORDER' };
@@ -220,6 +379,40 @@ app.post('/api/orders/create-and-prepare-card', async (req, res, next) => {
 
     res.json({ ok: true, order, writer_job: writerJob, rfid_payload_to_write: written_payload, message: 'Order created. Wio RFID writer will write this when a card is present.' });
   } catch (err) { if (err.code) return res.status(err.code).json({ ok: false, error: err.message }); next(err); }
+});
+
+// WiFi flow: set/add a stored-value balance and queue a "selecting" card write.
+// The Wio RFID writer writes {type:selecting,user_name} to the card; the balance
+// itself lives here in cards.csv and is spent at the machine.
+app.post('/api/cards/topup-and-prepare-card', async (req, res, next) => {
+  try {
+    const { user_name, amount, mode = 'add', card_uid = '' } = req.body;
+    const amt = toNumber(amount, NaN);
+    if (!user_name) return res.status(400).json({ ok: false, error: 'user_name is required' });
+    if (!Number.isFinite(amt) || amt < 0) return res.status(400).json({ ok: false, error: 'amount must be a non-negative number' });
+    if (!['add', 'set'].includes(mode)) return res.status(400).json({ ok: false, error: 'mode must be add or set' });
+
+    const cards = await readCards();
+    let card = cards.find(c => c.user_name === user_name);
+    const current = card ? toNumber(card.balance) : 0;
+    const newBalance = mode === 'set' ? amt : current + amt;
+    if (!card) { card = { card_uid: card_uid || '', user_name, mode: 'SELECTING', balance: '0', status: 'ACTIVE', created_at: nowIso(), updated_at: '', last_payload: '', notes: '' }; cards.push(card); }
+    card.balance = String(newBalance);
+    card.mode = 'SELECTING';
+    card.status = 'ACTIVE';
+    card.updated_at = nowIso();
+    if (card_uid) card.card_uid = card_uid;
+    card.last_payload = makeBalancePayload(user_name);
+    await writeCards(cards);
+    await appendCsv('card_ledger.csv', { time: nowIso(), card_uid: card.card_uid || card_uid, user_name, type: mode === 'set' ? 'SET' : 'TOPUP', amount: String(amt), balance_after: String(newBalance), actor: 'operator', notes: 'queued for Wio writer' }, cardLedgerHeaders);
+
+    const writerJobs = await readCsv('writer_jobs.csv');
+    const writerJob = { job_id: `WJ-${nanoid(8).toUpperCase()}`, order_number: '', user_name, rfid_payload: makeBalancePayload(user_name), rfid_card_uid: card_uid, status: 'PENDING', created_at: nowIso(), claimed_at: '', written_at: '', device_id: '', message: 'Waiting for card on Wio writer', job_type: 'BALANCE' };
+    writerJobs.push(writerJob);
+    await writeCsv('writer_jobs.csv', writerJobs, writerJobHeaders);
+
+    res.json({ ok: true, card, writer_job: writerJob, balance: newBalance, rfid_payload_to_write: writerJob.rfid_payload, message: 'Balance updated. Present a card on the Wio writer to encode the selecting card.' });
+  } catch (err) { next(err); }
 });
 
 // Local USB flow: reserve stock, create order, and write the card synchronously.
@@ -310,6 +503,57 @@ app.get('/api/device/status', async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
+// Connection status of the backend Wio RFID writer (WiFi heartbeat). Backs the
+// Writer Config page. Considered online if a heartbeat arrived in the last 15s.
+app.get('/api/device/writer-status', async (req, res, next) => {
+  try {
+    const [statuses, jobs] = await Promise.all([readCsv('device_status.csv'), readCsv('writer_jobs.csv')]);
+    const status = statuses.find(s => s.device_id === 'wio-rfid-writer') || null;
+    let online = false;
+    let seconds_since_seen = null;
+    if (status && status.last_seen_at) {
+      const delta = Date.now() - new Date(status.last_seen_at).getTime();
+      seconds_since_seen = Math.round(delta / 1000);
+      online = delta < 15000;
+    }
+    res.json({ ok: true, status, online, seconds_since_seen, pending_jobs: jobs.filter(j => ['PENDING', 'CLAIMED'].includes(j.status)).length });
+  } catch (err) { next(err); }
+});
+
+// ---- Wio Terminal setup (Config page): detect, set WiFi, flash via arduino-cli ----
+app.get('/api/wio/status', async (req, res, next) => {
+  try {
+    const [wioStatus, writerStatuses] = await Promise.all([wio.status(), readCsv('device_status.csv')]);
+    // Attach the live heartbeat for the writer so the card can show WiFi/runtime.
+    const writer = writerStatuses.find(s => s.device_id === 'wio-rfid-writer') || null;
+    let writer_online = false;
+    if (writer && writer.last_seen_at) writer_online = (Date.now() - new Date(writer.last_seen_at).getTime()) < 15000;
+    res.json({ ok: true, ...wioStatus, writer_runtime: { status: writer, online: writer_online } });
+  } catch (err) { next(err); }
+});
+
+// Save WiFi (and backend URL) into a target sketch, ready to flash. No upload here.
+app.post('/api/wio/wifi', async (req, res, next) => {
+  try {
+    const { target, ssid, password, backend_url } = req.body;
+    if (!WIO_TARGET_KEYS.includes(target)) return res.status(400).json({ ok: false, error: 'target must be frontend or writer' });
+    const config = await wio.writeConfig(target, { ssid, password, backend_url });
+    res.json({ ok: true, config, message: 'Settings saved to the sketch. Flash to apply.' });
+  } catch (err) { res.status(400).json({ ok: false, error: err.message }); }
+});
+
+// Compile + upload a target sketch to a connected Wio Terminal.
+app.post('/api/wio/flash', async (req, res, next) => {
+  try {
+    const { target, port } = req.body;
+    if (!WIO_TARGET_KEYS.includes(target)) return res.status(400).json({ ok: false, error: 'target must be frontend or writer' });
+    if (!port) return res.status(400).json({ ok: false, error: 'port is required (pick a connected Wio Terminal)' });
+    if (!(await wio.hasArduinoCli())) return res.status(501).json({ ok: false, error: 'arduino_cli_missing', message: 'arduino-cli was not found. Run backend-full locally (with arduino-cli installed) and the Wio connected by USB.' });
+    const result = await wio.flash(target, port);
+    res.status(result.ok ? 200 : 500).json({ ok: result.ok, port: result.port, target: result.target, log: result.log, message: result.ok ? 'Upload complete.' : 'Flash failed - see log.' });
+  } catch (err) { res.status(400).json({ ok: false, error: err.message }); }
+});
+
 app.post('/api/device/flash', requireLocalTools, async (req, res, next) => {
   try {
     const result = await device.flash();
@@ -397,22 +641,133 @@ app.post('/api/rfid-writer/job-result', requireDevice, async (req, res, next) =>
   } catch (err) { next(err); }
 });
 
+// Permission gate for the frontend Wio. Handles both card types:
+//   direct    -> validate a pre-created order, deduct stock, return one servo move.
+//   selecting -> return the card balance + per-column data for on-screen selection.
 app.post('/api/frontend/verify-card', requireDevice, async (req, res, next) => {
   try {
+    const type = String(req.body.type || 'direct').toLowerCase();
+
+    if (type === 'selecting') {
+      const { user_name } = req.body;
+      if (!user_name) return res.status(400).json({ ok: false, allow_dispense: false, error: 'user_name required' });
+      const cards = await readCards();
+      const card = cards.find(c => c.user_name === user_name && String(c.status || 'ACTIVE') !== 'DISABLED');
+      if (!card) return res.status(404).json({ ok: false, allow_dispense: false, error: 'card not found' });
+      const arrays = servoIndexedArrays(await readProducts());
+      return res.json({ ok: true, allow_dispense: true, type: 'selecting', user_name, balance: toNumber(card.balance), servo: arrays.servo, name: arrays.name, price: arrays.price, stock: arrays.stock, needs_refill: arrays.needs_refill, active: arrays.active, message: 'Card verified. Select products on the machine.' });
+    }
+
+    // ---- direct (single or multi-product) ----
     const { user_name, order_number, rfid_card_uid = '' } = req.body;
     const orders = await readCsv('orders.csv');
     const order = orders.find(o => o.user_name === user_name && o.order_number === order_number);
     if (!order) return res.status(404).json({ ok: false, allow_dispense: false, error: 'order not found' });
     if (order.status === 'DISPENSED') return res.status(409).json({ ok: false, allow_dispense: false, error: 'order already used' });
     if (!validOrderStartStates.has(order.status)) return res.status(409).json({ ok: false, allow_dispense: false, error: `invalid order status: ${order.status}` });
+
+    const items = orderItems(order);
+    const rawProducts = await readProducts();
+    // Validate every line item before deducting anything.
+    for (const it of items) {
+      const product = rawProducts.find(p => p.product_id === it.product_id);
+      if (!product || String(product.active) !== 'true') return res.status(409).json({ ok: false, allow_dispense: false, error: 'product unavailable' });
+      if (toNumber(product.inventory) < toNumber(it.qty)) {
+        order.notes = 'Blocked at machine: needs refill';
+        await writeCsv('orders.csv', orders, orderHeaders);
+        return res.status(409).json({ ok: false, allow_dispense: false, error: 'needs_refill', message: `${product.product_name} (column ${product.slot_id || product.servo_id}) needs refill. See staff.` });
+      }
+    }
+    // Deduct all items now (authorize step); dispense-complete(false) rolls back.
+    // times[] is per-servo (1..4) dispense counts for the frontend.
+    const times = [0, 0, 0, 0];
+    for (const it of items) {
+      const product = rawProducts.find(p => p.product_id === it.product_id);
+      const s = toNumber(product.servo_id);
+      if (s >= 1 && s <= 4) times[s - 1] += toNumber(it.qty);
+      product.inventory = String(toNumber(product.inventory) - toNumber(it.qty));
+      await appendCsv('inventory_log.csv', { time: nowIso(), action: 'DISPENSE', product_id: product.product_id, product_name: product.product_name, quantity_delta: -toNumber(it.qty), inventory_after: product.inventory, actor: req.device.device_id, notes: order.order_number }, inventoryLogHeaders);
+    }
+    await writeProducts(rawProducts);
+
     order.status = 'VERIFIED';
     order.verified_at = nowIso();
     order.frontend_id = req.device.device_id;
     if (rfid_card_uid) order.rfid_card_uid = rfid_card_uid;
     await writeCsv('orders.csv', orders, orderHeaders);
-    const products = await readProducts();
-    const product = products.find(p => p.product_id === order.product_id);
-    res.json({ ok: true, allow_dispense: true, order_number: order.order_number, product_id: order.product_id, product_name: order.product_name, quantity: toNumber(order.quantity, 1), slot_id: product?.slot_id || '', servo_id: product?.servo_id || '', message: 'Card verified. Dispense the reserved item now.' });
+
+    // Back-compat single fields (first item) + per-servo times[] for multi.
+    const first = items[0];
+    const firstProduct = rawProducts.find(p => p.product_id === first.product_id) || {};
+    res.json({ ok: true, allow_dispense: true, type: 'direct', order_number: order.order_number, product_name: order.product_name, servo_id: firstProduct.servo_id || '', quantity: toNumber(first.qty, 1), times, message: 'Card verified. Dispensing now.' });
+  } catch (err) { next(err); }
+});
+
+// Selecting checkout: the customer picked items on the machine. items is a
+// 4-length array of quantities indexed by servo id 1..4. Validates stock +
+// balance, deducts both, and returns the servo dispense plan.
+app.post('/api/frontend/selecting/checkout', requireDevice, async (req, res, next) => {
+  try {
+    const { user_name, rfid_card_uid = '' } = req.body;
+    const items = Array.isArray(req.body.items) ? req.body.items.map(n => Math.max(0, Math.round(toNumber(n, 0)))) : [];
+    if (!user_name) return res.status(400).json({ ok: false, allow_dispense: false, error: 'user_name required' });
+    if (items.length === 0 || items.every(q => q <= 0)) return res.status(400).json({ ok: false, allow_dispense: false, error: 'no items selected' });
+
+    const cards = await readCards();
+    const card = cards.find(c => c.user_name === user_name && String(c.status || 'ACTIVE') !== 'DISABLED');
+    if (!card) return res.status(404).json({ ok: false, allow_dispense: false, error: 'card not found' });
+
+    const rawProducts = await readProducts();
+    const bySrv = {};
+    for (const p of rawProducts) { const s = toNumber(p.servo_id); if (s >= 1 && s <= 4) bySrv[s] = p; }
+
+    let total = 0;
+    const plan = [];
+    const purchased = [];
+    for (let i = 0; i < items.length && i < 4; i++) {
+      const qty = items[i];
+      if (qty <= 0) continue;
+      const product = bySrv[i + 1];
+      if (!product || String(product.active) !== 'true') return res.status(409).json({ ok: false, allow_dispense: false, error: `servo ${i + 1} unavailable` });
+      if (toNumber(product.inventory) < qty) return res.status(409).json({ ok: false, allow_dispense: false, error: 'needs_refill', message: `${product.product_name} needs refill.` });
+      total += toNumber(product.price) * qty;
+      plan.push({ servo_id: i + 1, times: qty });
+      purchased.push({ product_id: product.product_id, qty });
+    }
+    const balance = toNumber(card.balance);
+    if (total > balance) return res.status(402).json({ ok: false, allow_dispense: false, error: 'insufficient_balance', message: `Balance ${balance.toFixed(2)} is less than cost ${total.toFixed(2)}.` });
+
+    for (const item of purchased) {
+      const product = rawProducts.find(p => p.product_id === item.product_id);
+      product.inventory = String(toNumber(product.inventory) - item.qty);
+      await appendCsv('inventory_log.csv', { time: nowIso(), action: 'DISPENSE', product_id: product.product_id, product_name: product.product_name, quantity_delta: -item.qty, inventory_after: product.inventory, actor: req.device.device_id, notes: 'selecting' }, inventoryLogHeaders);
+    }
+    await writeProducts(rawProducts);
+
+    const newBalance = balance - total;
+    card.balance = String(newBalance);
+    card.status = 'ACTIVE';
+    card.updated_at = nowIso();
+    if (rfid_card_uid && !card.card_uid) card.card_uid = rfid_card_uid;
+    await writeCards(cards);
+    await appendCsv('card_ledger.csv', { time: nowIso(), card_uid: card.card_uid || rfid_card_uid, user_name, type: 'PURCHASE', amount: String(total), balance_after: String(newBalance), actor: req.device.device_id, notes: purchased.map(x => `${x.product_id}x${x.qty}`).join(' ') }, cardLedgerHeaders);
+
+    const order_number = makeOrderNumber();
+    const summary = purchased.map(x => `${x.product_id}x${x.qty}`).join(' ');
+    const orders = await readCsv('orders.csv');
+    orders.push({ order_number, user_name, product_id: 'SELECT', product_name: `Selecting: ${summary}`, quantity: String(purchased.reduce((s, x) => s + x.qty, 0)), amount_paid: String(total), status: 'VERIFIED', rfid_card_uid: rfid_card_uid || card.card_uid || '', written_payload: JSON.stringify(purchased), created_at: nowIso(), written_at: '', verified_at: nowIso(), dispensed_at: '', frontend_id: req.device.device_id, notes: 'selecting checkout' });
+    await writeCsv('orders.csv', orders, orderHeaders);
+
+    const customers = await readCsv('customers.csv');
+    let customer = customers.find(c => c.user_name === user_name);
+    if (!customer) { customer = { user_name, total_paid: '0', total_orders: '0', last_order_number: '', created_at: nowIso(), updated_at: nowIso() }; customers.push(customer); }
+    customer.total_paid = String(toNumber(customer.total_paid) + total);
+    customer.total_orders = String(toNumber(customer.total_orders) + 1);
+    customer.last_order_number = order_number;
+    customer.updated_at = nowIso();
+    await writeCsv('customers.csv', customers, customerHeaders);
+
+    res.json({ ok: true, allow_dispense: true, type: 'selecting', order_number, plan, total, new_balance: newBalance, message: 'Approved. Dispensing now.' });
   } catch (err) { next(err); }
 });
 
@@ -422,12 +777,20 @@ app.post('/api/frontend/dispense-complete', requireDevice, async (req, res, next
     const orders = await readCsv('orders.csv');
     const order = orders.find(o => o.order_number === order_number);
     if (!order) return res.status(404).json({ ok: false, error: 'order not found' });
-    order.status = success ? 'DISPENSED' : 'DISPENSE_FAILED';
-    order.dispensed_at = nowIso();
-    order.frontend_id = req.device.device_id;
-    order.notes = notes;
-    await writeCsv('orders.csv', orders, orderHeaders);
-    res.json({ ok: true, order, message: success ? 'Order completed.' : 'Dispense failed. Operator review needed.' });
+    if (order.status !== 'DISPENSED') {
+      if (success) {
+        order.status = 'DISPENSED';
+      } else {
+        order.status = 'DISPENSE_FAILED';
+        // Stock (and balance for selecting) was taken at the authorize step.
+        await rollbackOrder(order, req.device.device_id);
+      }
+      order.dispensed_at = nowIso();
+      order.frontend_id = req.device.device_id;
+      order.notes = notes || order.notes;
+      await writeCsv('orders.csv', orders, orderHeaders);
+    }
+    res.json({ ok: true, order, message: success ? 'Order completed.' : 'Dispense failed. Stock/balance rolled back.' });
   } catch (err) { next(err); }
 });
 
@@ -438,13 +801,9 @@ app.post('/api/orders/:orderNumber/cancel', async (req, res, next) => {
     if (!order) return res.status(404).json({ ok: false, error: 'order not found' });
     if (order.status === 'DISPENSED') return res.status(409).json({ ok: false, error: 'cannot cancel dispensed order' });
     if (order.status !== 'CANCELLED') {
-      const rawProducts = await readProducts();
-      const product = rawProducts.find(p => p.product_id === order.product_id);
-      if (product) {
-        product.inventory = String(toNumber(product.inventory) + toNumber(order.quantity));
-        await writeProducts(rawProducts);
-        await appendCsv('inventory_log.csv', { time: nowIso(), action: 'CANCEL_RELEASE_STOCK', product_id: product.product_id, product_name: product.product_name, quantity_delta: toNumber(order.quantity), inventory_after: product.inventory, actor: 'dashboard', notes: req.params.orderNumber }, inventoryLogHeaders);
-      }
+      // Stock is only ever removed at the authorize step (VERIFIED). A pending
+      // write / written card never held stock, so nothing to release for those.
+      if (order.status === 'VERIFIED') await rollbackOrder(order, 'dashboard-cancel');
       order.status = 'CANCELLED';
       order.notes = `${order.notes || ''}${order.notes ? ' | ' : ''}Cancelled from dashboard`;
       await writeCsv('orders.csv', orders, orderHeaders);

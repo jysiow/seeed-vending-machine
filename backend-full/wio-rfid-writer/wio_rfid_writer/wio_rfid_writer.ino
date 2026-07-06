@@ -11,8 +11,13 @@
   2. Check RFID module and card presence
   3. Check backend-center connection
   4. Poll backend-center for pending RFID write jobs
-  5. When card is present, write user_name/order_number payload to card
+  5. When a card is present, write the job payload to the card:
+       - ORDER   job -> {"type":"direct","user_name":..,"order_number":..,"v":1}
+       - BALANCE job -> {"type":"selecting","user_name":..,"v":1}
   6. Report result to backend-center
+
+  Flash this sketch to the backend Wio Terminal ONCE. It then stays connected
+  over WiFi and writes any queued card - there is no per-card upload.
 
   Libraries required:
   - Seeed Wio Terminal board support
@@ -29,9 +34,9 @@
 #include "Emakefun_RFID.h"
 
 // ---------------- User config ----------------
-const char* WIFI_SSID = "YOUR_WIFI_SSID";
-const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
-const char* API_BASE = "http://YOUR_PC_IP:3000";  // example: http://192.168.1.20:3000
+const char* WIFI_SSID = "SEEED-MKT";
+const char* WIFI_PASSWORD = "edgemaker2023";
+const char* API_BASE = "http://192.168.7.164:3000";  // example: http://192.168.1.20:3000
 const char* DEVICE_ID = "wio-rfid-writer";
 const char* API_KEY = "WIO_WRITER_SECRET";
 
@@ -97,8 +102,12 @@ void drawDashboard(const String& message) {
 }
 
 bool connectWifi() {
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   drawDashboard("Connecting WiFi...");
+  WiFi.disconnect(true);          // clear any half-open state
+  delay(150);
+  WiFi.mode(WIFI_STA);            // rpcWiFi is unreliable without an explicit mode
+  delay(150);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   unsigned long start = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) {
     delay(500);
@@ -111,13 +120,15 @@ String httpRequest(const String& method, const String& path, const String& body 
   HTTPClient http;
   String url = String(API_BASE) + path;
   http.begin(url);
+  http.setTimeout(8000);   // never block the UI if the backend URL is wrong/unreachable
   http.addHeader("Content-Type", "application/json");
   http.addHeader("x-device-id", DEVICE_ID);
   http.addHeader("x-api-key", API_KEY);
   int code = 0;
   if (method == "GET") code = http.GET();
   else code = http.POST(body);
-  String response = code > 0 ? http.getString() : "";
+  String response = "";
+  if (code > 0) response = http.getString();
   http.end();
   serverConnected = (code >= 200 && code < 300);
   return response;
@@ -187,13 +198,23 @@ void pollJob() {
   currentJobId = jsonValue(res, "job_id");
   String userName = jsonValue(res, "user_name");
   currentOrderNumber = jsonValue(res, "order_number");
+  String jobType = jsonValue(res, "job_type");   // ORDER or BALANCE
 
-  // The server stores JSON in CSV, so the HTTP response contains escaped quotes.
-  // To keep the Arduino-side parser simple and reliable, compose the exact
-  // RFID card JSON locally from the plain user_name and order_number fields.
-  currentPayload = "{\"user_name\":\"" + userName + "\",\"order_number\":\"" + currentOrderNumber + "\",\"v\":1}";
+  // The server stores JSON in CSV, so the raw rfid_payload comes back with
+  // escaped quotes. To keep the Arduino-side parser simple and reliable,
+  // compose the exact RFID card JSON locally from the plain fields.
+  bool ok = false;
+  if (jobType == "BALANCE") {
+    // Selecting card: the money balance is tracked in the backend by user_name.
+    currentPayload = "{\"type\":\"selecting\",\"user_name\":\"" + userName + "\",\"v\":1}";
+    ok = currentJobId.length() > 0 && userName.length() > 0;
+  } else {
+    // Direct order card.
+    currentPayload = "{\"type\":\"direct\",\"user_name\":\"" + userName + "\",\"order_number\":\"" + currentOrderNumber + "\",\"v\":1}";
+    ok = currentJobId.length() > 0 && userName.length() > 0 && currentOrderNumber.length() > 0;
+  }
 
-  if (currentJobId.length() == 0 || userName.length() == 0 || currentOrderNumber.length() == 0) {
+  if (!ok) {
     currentJobId = "";
     currentOrderNumber = "";
     currentPayload = "";
@@ -206,7 +227,7 @@ void setup() {
   tft.setRotation(3);
   drawDashboard("Booting...");
 
-  Wire.begin();
+  Wire1.begin();          // Wio Grove I2C is on Wire1 (see Emakefun_RFID.cpp remap)
   mfrc522.PCD_Init();
   for (byte i = 0; i < 6; i++) key.keyByte[i] = 0xFF;
   rfidReady = true;

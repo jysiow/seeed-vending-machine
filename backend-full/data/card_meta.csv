@@ -1,1 +1,7 @@
 card_uid,status,created_at,updated_at,last_payload,notes
+11 4A 47 A0,ACTIVE,,,,
+17 6C EE EA,ACTIVE,,,,
+21 0E 4A A0,ACTIVE,2026-07-05T10:16:46.211Z,2026-07-05T10:17:36.173Z,"{""type"":""selecting"",""user_name"":""matthew"",""v"":1}",
+21 0E 4A A0,ACTIVE,2026-07-05T10:16:46.211Z,2026-07-05T10:17:36.173Z,"{""type"":""selecting"",""user_name"":""matthew"",""v"":1}",
+,ACTIVE,2026-07-05T15:56:16.039Z,2026-07-05T16:02:15.451Z,"{""type"":""selecting"",""user_name"":""matthew3"",""v"":1}",
+,ACTIVE,2026-07-06T03:36:41.816Z,2026-07-06T03:36:41.816Z,"{""type"":""selecting"",""user_name"":""fansng"",""v"":1}",
